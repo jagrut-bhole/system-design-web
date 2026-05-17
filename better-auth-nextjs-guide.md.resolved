@@ -1,0 +1,643 @@
+# Better Auth in Next.js — End-to-End Setup Guide
+
+> Based on **better-auth v1.x** + **Next.js 15/16 App Router** + **Prisma (PostgreSQL)**
+
+---
+
+## Table of Contents
+
+1. [Install Dependencies](#1-install-dependencies)
+2. [Environment Variables](#2-environment-variables)
+3. [Prisma Schema](#3-prisma-schema)
+4. [Prisma Client Singleton](#4-prisma-client-singleton)
+5. [Server Auth Config (`lib/auth.ts`)](#5-server-auth-config)
+6. [API Route Handler](#6-api-route-handler)
+7. [Client Auth Config (`lib/auth-client.ts`)](#7-client-auth-config)
+8. [Using Auth in Client Components](#8-using-auth-in-client-components)
+9. [Using Auth in Server Components](#9-using-auth-in-server-components)
+10. [Using Auth in API Route Handlers](#10-using-auth-in-api-route-handlers)
+11. [Protected Page Pattern (Auth Layout)](#11-protected-page-pattern-auth-layout)
+12. [Sign-Up Flow](#12-sign-up-flow)
+13. [Sign-In Flow](#13-sign-in-flow)
+14. [Sign-Out Flow](#14-sign-out-flow)
+15. [Common Gotchas](#15-common-gotchas)
+
+---
+
+## 1. Install Dependencies
+
+```bash
+# Using bun
+bun add better-auth @prisma/client @prisma/adapter-pg pg
+bun add -d prisma @types/pg
+
+# Using npm
+npm install better-auth @prisma/client @prisma/adapter-pg pg
+npm install -D prisma @types/pg
+```
+
+---
+
+## 2. Environment Variables
+
+> [!IMPORTANT]
+> Next.js only exposes env vars to the **browser** if they are prefixed with `NEXT_PUBLIC_`.
+> You need **two** auth URL vars — one for the server, one for the client.
+
+```env
+# .env
+
+# Database
+DATABASE_URL="postgresql://user:password@localhost:5432/mydb"
+
+# Better Auth — generate with: openssl rand -base64 32
+BETTER_AUTH_SECRET="your-secret-here"
+
+# Server-side URL (used in lib/auth.ts)
+BETTER_AUTH_URL=http://localhost:3000
+
+# Client-side URL (used in lib/auth-client.ts — MUST have NEXT_PUBLIC_ prefix)
+NEXT_PUBLIC_BETTER_AUTH_URL=http://localhost:3000
+```
+
+---
+
+## 3. Prisma Schema
+
+Add these **exact** models to your `prisma/schema.prisma`. Better Auth is strict about field names.
+
+```prisma
+// prisma/schema.prisma
+
+generator client {
+  provider = "prisma-client-js"
+  // or if using custom output:
+  // output = "../app/generated/prisma"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+model User {
+  id            String    @id @default(cuid())
+  name          String
+  email         String    @unique
+  emailVerified Boolean   @default(false)
+  image         String?
+  createdAt     DateTime  @default(now())
+  updatedAt     DateTime  @updatedAt
+
+  // Add your own custom fields below
+  // dailyCreditLimit Int @default(10)
+
+  accounts Account[]
+  sessions Session[]
+
+  @@map("user")
+}
+
+model Account {
+  id                    String    @id @default(cuid())
+  userId                String
+  accountId             String
+  providerId            String
+  accessToken           String?
+  refreshToken          String?
+  idToken               String?
+  accessTokenExpiresAt  DateTime?
+  refreshTokenExpiresAt DateTime?
+  scope                 String?
+  password              String?   // hashed — only for email/password
+  createdAt             DateTime  @default(now())
+  updatedAt             DateTime  @updatedAt
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@unique([providerId, accountId])
+  @@index([userId])
+  @@map("account")
+}
+
+model Session {
+  id        String   @id @default(cuid())
+  userId    String
+  token     String   @unique
+  expiresAt DateTime
+  ipAddress String?
+  userAgent String?
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([userId])
+  @@map("session")
+}
+
+model Verification {
+  id         String   @id @default(cuid())
+  identifier String
+  value      String
+  expiresAt  DateTime
+  createdAt  DateTime @default(now())
+  updatedAt  DateTime @updatedAt
+
+  @@index([identifier])
+  @@map("verification")
+}
+```
+
+Then run migrations:
+
+```bash
+npx prisma migrate dev --name add-better-auth
+# or with bun
+bun prisma migrate dev --name add-better-auth
+```
+
+> [!TIP]
+> You can also use `npx @better-auth/cli generate` to auto-generate the schema for you, but manual is fine too.
+
+---
+
+## 4. Prisma Client Singleton
+
+Prevent multiple Prisma Client instances in dev (hot reload creates new instances on every save).
+
+```ts
+// lib/db/prisma.ts
+import { PrismaClient } from "@prisma/client";
+// If using pg adapter:
+import { PrismaPg } from "@prisma/adapter-pg";
+
+const connectionString = process.env.DATABASE_URL!;
+
+function createPrismaClient() {
+  const adapter = new PrismaPg({ connectionString });
+  return new PrismaClient({ adapter });
+}
+
+// Singleton pattern — prevents hot-reload from spawning multiple clients
+declare global {
+  var prismaGlobal: ReturnType<typeof createPrismaClient> | undefined;
+}
+
+const prisma = globalThis.prismaGlobal ?? createPrismaClient();
+
+if (process.env.NODE_ENV !== "production") {
+  globalThis.prismaGlobal = prisma;
+}
+
+export default prisma;
+```
+
+> [!WARNING]
+> If you skip the singleton pattern, in development you will get "too many connections" errors very quickly because Next.js hot-reloads re-instantiate the module.
+
+---
+
+## 5. Server Auth Config
+
+```ts
+// lib/auth.ts
+import { betterAuth } from "better-auth";
+import { prismaAdapter } from "better-auth/adapters/prisma";
+import prisma from "@/lib/db/prisma";
+
+export const auth = betterAuth({
+  // 1. Database adapter
+  database: prismaAdapter(prisma, {
+    provider: "postgresql",
+  }),
+
+  // 2. Base URL — tells Better Auth where your app lives
+  baseURL: process.env.BETTER_AUTH_URL,
+
+  // 3. Secret — used to sign tokens
+  secret: process.env.BETTER_AUTH_SECRET,
+
+  // 4. Enable email + password login
+  emailAndPassword: {
+    enabled: true,
+    requireEmailVerification: false, // set true when you add email sending
+    autoSignIn: true,                // auto sign-in after sign-up
+    revokeSessionsOnPasswordReset: true,
+  },
+
+  // 5. Session config
+  session: {
+    expiresIn: 60 * 60 * 24 * 20,  // 20 days
+    updateAge: 60 * 60 * 24,        // refresh if older than 1 day
+  },
+
+  // 6. Advanced (optional)
+  advanced: {
+    // Track IP for security (disable if privacy is a concern)
+    ipAddress: {
+      disableIpTracking: false,
+      ipAddressHeaders: ["x-forwarded-for", "cf-connecting-ip", "x-real-ip"],
+    },
+
+    // Required for cross-subdomain cookie sharing (e.g. app.example.com + api.example.com)
+    crossSubDomainCookies: {
+      enabled: true,
+    },
+
+    defaultCookieAttributes: {
+      sameSite: "lax",
+      secure: process.env.NODE_ENV === "production",
+    },
+  },
+});
+
+// Export types for use throughout the app
+export type Session = typeof auth.$Infer.Session;
+```
+
+---
+
+## 6. API Route Handler
+
+Better Auth needs a single catch-all route to handle all auth endpoints (sign-in, sign-up, sign-out, session, etc.).
+
+```ts
+// app/api/auth/[...all]/route.ts
+import { auth } from "@/lib/auth";
+import { toNextJsHandler } from "better-auth/next-js";
+
+export const { GET, POST } = toNextJsHandler(auth);
+```
+
+This single file handles all of these automatically:
+- `POST /api/auth/sign-in/email`
+- `POST /api/auth/sign-up/email`
+- `POST /api/auth/sign-out`
+- `GET /api/auth/get-session`
+- `POST /api/auth/change-password`
+- ...and more
+
+---
+
+## 7. Client Auth Config
+
+```ts
+// lib/auth-client.ts
+import { createAuthClient } from "better-auth/react";
+
+export const authClient = createAuthClient({
+  // MUST be NEXT_PUBLIC_ so browser can read it
+  baseURL: process.env.NEXT_PUBLIC_BETTER_AUTH_URL,
+
+  // Must match where your API route is mounted
+  basePath: "/api/auth",
+
+  fetchOptions: {
+    // Required — sends the session cookie with every request
+    credentials: "include",
+  },
+});
+
+// Re-export everything for convenience
+export const {
+  signIn,
+  signUp,
+  signOut,
+  useSession,
+  getSession,
+} = authClient;
+```
+
+> [!IMPORTANT]
+> `basePath` must exactly match your `app/api/auth/[...all]` path. Default is `/api/auth`.
+
+---
+
+## 8. Using Auth in Client Components
+
+### Reading the session
+
+```tsx
+// components/UserAvatar.tsx
+"use client";
+
+import { useSession } from "@/lib/auth-client";
+
+export function UserAvatar() {
+  const { data: session, isPending, error } = useSession();
+
+  if (isPending) return <div>Loading...</div>;
+  if (!session)  return <div>Not logged in</div>;
+
+  return (
+    <div>
+      <p>Hello, {session.user.name}!</p>
+      <p>{session.user.email}</p>
+    </div>
+  );
+}
+```
+
+### Sign-In form
+
+```tsx
+"use client";
+
+import { useState } from "react";
+import { authClient } from "@/lib/auth-client";
+import { useRouter } from "next/navigation";
+
+export function SignInForm() {
+  const router = useRouter();
+  const [error, setError] = useState("");
+
+  async function handleSubmit(e: React.FormEvent<HTMLFormElement>) {
+    e.preventDefault();
+    const formData = new FormData(e.currentTarget);
+
+    const { error } = await authClient.signIn.email({
+      email: formData.get("email") as string,
+      password: formData.get("password") as string,
+    });
+
+    if (error) {
+      setError(error.message ?? "Sign in failed");
+    } else {
+      router.push("/dashboard");
+    }
+  }
+
+  return (
+    <form onSubmit={handleSubmit}>
+      <input name="email" type="email" required />
+      <input name="password" type="password" required />
+      {error && <p style={{ color: "red" }}>{error}</p>}
+      <button type="submit">Sign In</button>
+    </form>
+  );
+}
+```
+
+### Sign-Up form
+
+```tsx
+"use client";
+
+import { authClient } from "@/lib/auth-client";
+import { useRouter } from "next/navigation";
+
+export function SignUpForm() {
+  const router = useRouter();
+
+  async function handleSubmit(e: React.FormEvent<HTMLFormElement>) {
+    e.preventDefault();
+    const formData = new FormData(e.currentTarget);
+
+    const { error } = await authClient.signUp.email({
+      name: formData.get("name") as string,
+      email: formData.get("email") as string,
+      password: formData.get("password") as string,
+    });
+
+    if (error) {
+      console.error(error.message);
+    } else {
+      router.push("/dashboard"); // autoSignIn: true redirects automatically
+    }
+  }
+
+  return (
+    <form onSubmit={handleSubmit}>
+      <input name="name" type="text" required />
+      <input name="email" type="email" required />
+      <input name="password" type="password" required />
+      <button type="submit">Sign Up</button>
+    </form>
+  );
+}
+```
+
+### Sign-Out button
+
+```tsx
+"use client";
+
+import { authClient } from "@/lib/auth-client";
+import { useRouter } from "next/navigation";
+
+export function SignOutButton() {
+  const router = useRouter();
+
+  async function handleSignOut() {
+    await authClient.signOut();
+    router.push("/auth/sign-in");
+  }
+
+  return <button onClick={handleSignOut}>Sign Out</button>;
+}
+```
+
+---
+
+## 9. Using Auth in Server Components
+
+In Server Components and Server Actions, import `auth` directly and pass the incoming `headers`.
+
+```tsx
+// app/dashboard/page.tsx
+import { auth } from "@/lib/auth";
+import { headers } from "next/headers";
+import { redirect } from "next/navigation";
+
+export default async function DashboardPage() {
+  const session = await auth.api.getSession({
+    headers: await headers(), // pass request headers so Better Auth can read the cookie
+  });
+
+  if (!session) {
+    redirect("/auth/sign-in");
+  }
+
+  return (
+    <main>
+      <h1>Welcome, {session.user.name}!</h1>
+    </main>
+  );
+}
+```
+
+---
+
+## 10. Using Auth in API Route Handlers
+
+```ts
+// app/api/some-protected-route/route.ts
+import { auth } from "@/lib/auth";
+import { headers } from "next/headers";
+import { NextResponse } from "next/server";
+
+export async function GET() {
+  const session = await auth.api.getSession({
+    headers: await headers(),
+  });
+
+  if (!session) {
+    return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
+  }
+
+  // session.user.id, session.user.email, session.user.name are available
+  return NextResponse.json({
+    message: `Hello ${session.user.name}`,
+    userId: session.user.id,
+  });
+}
+```
+
+---
+
+## 11. Protected Page Pattern (Auth Layout)
+
+### Protect auth pages (redirect logged-in users away)
+
+Use a layout to redirect users who are **already logged in** away from auth pages.
+
+```tsx
+// app/auth/layout.tsx
+"use client";
+
+import { useRouter, useSearchParams } from "next/navigation";
+import React, { Suspense, useEffect } from "react";
+import { authClient } from "@/lib/auth-client";
+
+// Must be in its own component because useSearchParams needs Suspense
+function AuthRedirector() {
+  const { data: session, isPending } = authClient.useSession();
+  const router = useRouter();
+  const searchParams = useSearchParams();
+  const redirectTo = searchParams.get("redirectTo");
+
+  useEffect(() => {
+    // Redirect AWAY if already logged in
+    if (!isPending && session) {
+      router.replace(redirectTo ?? "/");
+    }
+  }, [session, isPending, redirectTo, router]);
+
+  return null;
+}
+
+export default function AuthLayout({ children }: { children: React.ReactNode }) {
+  return (
+    <>
+      <Suspense fallback={null}>
+        <AuthRedirector />
+      </Suspense>
+      {children}
+    </>
+  );
+}
+```
+
+### Protect app pages (redirect logged-out users to sign-in)
+
+```tsx
+// app/(app)/layout.tsx
+"use client";
+
+import { useRouter } from "next/navigation";
+import { useEffect } from "react";
+import { authClient } from "@/lib/auth-client";
+
+export default function AppLayout({ children }: { children: React.ReactNode }) {
+  const { data: session, isPending } = authClient.useSession();
+  const router = useRouter();
+
+  useEffect(() => {
+    // Redirect to sign-in if NOT logged in
+    if (!isPending && !session) {
+      router.replace("/auth/sign-in");
+    }
+  }, [session, isPending, router]);
+
+  if (isPending) return <div>Loading...</div>;
+  if (!session)  return null; // prevent flash of content
+
+  return <>{children}</>;
+}
+```
+
+> [!TIP]
+> For better UX on server-side, prefer checking in a Server Component (`auth.api.getSession`) and using `redirect()` instead of client-side redirects.
+
+---
+
+## 12. Sign-Up Flow
+
+What happens when a user signs up with `authClient.signUp.email(...)`:
+
+1. `POST /api/auth/sign-up/email` is called
+2. Better Auth creates a `User` record
+3. Better Auth creates an `Account` record with `providerId: "credential"`
+4. The password is **hashed** (bcrypt) and stored in `Account.password`
+5. If `autoSignIn: true`, a `Session` is created and the cookie is set automatically
+6. The response contains the session token
+
+---
+
+## 13. Sign-In Flow
+
+What happens when a user signs in with `authClient.signIn.email(...)`:
+
+1. `POST /api/auth/sign-in/email` is called
+2. Better Auth looks up the user by email
+3. It finds the `Account` with `providerId: "credential"` and compares the hashed password
+4. If correct, a new `Session` is created
+5. A `better-auth.session_token` HTTP-only cookie is set
+6. All subsequent `fetch` calls with `credentials: "include"` send this cookie automatically
+
+---
+
+## 14. Sign-Out Flow
+
+```ts
+await authClient.signOut();
+```
+
+1. `POST /api/auth/sign-out` is called
+2. The `Session` record is deleted from the database
+3. The cookie is cleared
+4. `useSession()` returns `null`
+
+---
+
+## 15. Common Gotchas
+
+| Problem | Cause | Fix |
+|---|---|---|
+| `authClient` sends requests to `undefined` | Missing `NEXT_PUBLIC_` prefix on env var | Add `NEXT_PUBLIC_BETTER_AUTH_URL` to `.env` |
+| Cookies not sent | Missing `credentials: "include"` | Add `fetchOptions: { credentials: "include" }` to `createAuthClient` |
+| Auth redirects loop | Wrong condition in layout `useEffect` | Redirect when `session` is truthy in auth layout; when `!session` in app layout |
+| Too many DB connections in dev | No Prisma singleton | Use `globalThis` singleton pattern (see §4) |
+| `Account` schema errors | Leftover NextAuth fields | Use exact Better Auth schema — `accountId`/`providerId`, NOT `provider`/`providerAccountId` |
+| `basePath` mismatch | `authClient.basePath` doesn't match `app/api/auth/[...all]` | Default `/api/auth` — only change if you move the route |
+| `headers()` error in server | Not awaiting `headers()` in Next.js 15+ | Always `await headers()` |
+| Session not refreshing | `updateAge` too high | Default is fine; lower it if you need fresher sessions |
+
+---
+
+## Quick Checklist
+
+- [ ] `better-auth` installed
+- [ ] `BETTER_AUTH_SECRET` set (32+ random bytes)
+- [ ] `BETTER_AUTH_URL` set (server-side)
+- [ ] `NEXT_PUBLIC_BETTER_AUTH_URL` set (client-side)
+- [ ] Prisma schema has `User`, `Account`, `Session`, `Verification` models with correct field names
+- [ ] `@@map("user")`, `@@map("account")`, `@@map("session")`, `@@map("verification")` present
+- [ ] `Account` uses `accountId`/`providerId` (not `provider`/`providerAccountId`)
+- [ ] Migration run after schema changes
+- [ ] `app/api/auth/[...all]/route.ts` exists with `toNextJsHandler(auth)`
+- [ ] `authClient` has `basePath: "/api/auth"` and `credentials: "include"`
+- [ ] Server code uses `auth.api.getSession({ headers: await headers() })`
+- [ ] Auth layout redirects when `session` exists (not `!session`)
+- [ ] App layout redirects when `!session` (not `session`)
