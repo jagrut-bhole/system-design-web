@@ -25,13 +25,12 @@ enum AttemptStatus {
 // ─── Better Auth required tables ─────────────────────────
 
 model User {
-  id            String    @id @default(cuid())
-  email         String    @unique
-  name          String?
-  image         String?
-  emailVerified DateTime?
-  createdAt     DateTime  @default(now())
-  updatedAt     DateTime  @updatedAt
+  id        String   @id @default(cuid())
+  email     String   @unique
+  name      String?
+  image     String?
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
 
   // Your custom fields
   dailyCreditLimit Int @default(10) // 10 attempts/day free
